@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+psycopg2-binary
+asyncpg
+pandas
+requests
+python-dotenv
+websocket-client
+ta
+tqdm
