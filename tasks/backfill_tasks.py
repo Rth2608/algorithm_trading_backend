@@ -5,7 +5,7 @@ import time
 import math
 import random
 from collections import deque
-from typing import Any, Dict, List, Optional, Tuple, Set
+from typing import Any, Dict, List, Optional, Tuple, Set, Callable
 
 from celery import Celery
 import httpx
@@ -115,9 +115,6 @@ except Exception:
 
 
 def _redis_incr_with_ttl(key: str, limit: int, ttl: int) -> bool:
-    """
-    원자적 INCR. 첫 증가면 TTL 설정. limit 초과하면 롤백(DECR) 후 False.
-    """
     if _redis is None:
         return True
     pipe = _redis.pipeline()
@@ -138,11 +135,8 @@ def _redis_incr_with_ttl(key: str, limit: int, ttl: int) -> bool:
 
 
 def _global_acquire() -> None:
-    """
-    초/분 전역 제한 / 초과 시 다음 경계까지 대기
-    """
     if _redis is None:
-        return  # fallback
+        return
 
     while True:
         now = time.time()
@@ -216,9 +210,6 @@ def _load_fapi_symbols(client: httpx.Client) -> Set[str]:
 def _binance_get_with_retry(
     client: httpx.Client, url: str, params: Dict[str, Any]
 ) -> httpx.Response:
-    """
-    - 전역 Redis + 로컬 큐 동시 사용
-    """
     last_resp: Optional[httpx.Response] = None
     for attempt in range(BINANCE_MAX_RETRIES + 1):
         _global_acquire()
@@ -259,6 +250,36 @@ def _binance_get_with_retry(
     )
 
 
+_MS_PER_INTERVAL = {
+    "1m": 60_000,
+    "5m": 300_000,
+    "15m": 900_000,
+    "1h": 3_600_000,
+    "4h": 14_400_000,
+    "1d": 86_400_000,
+}
+
+
+def _estimate_chunk_total(symbol: str, interval: str, client: httpx.Client) -> int:
+    """대략적인 총 청크 수(= 1000캔들 단위)를 추정"""
+    url = f"{BINANCE_API_BASE}{BINANCE_KLINES_PATH}"
+    params = {"symbol": symbol, "interval": interval, "startTime": 0, "limit": 1}
+    _global_acquire()
+    _LOCAL_RL.acquire()
+    resp = client.get(url, params=params)
+    resp.raise_for_status()
+    arr = resp.json()
+    if not arr:
+        return 1
+    earliest_open_ms = int(arr[0][0])
+    now_ms = int(time.time() * 1000)
+    step = _MS_PER_INTERVAL.get(interval, 60_000)
+    if step <= 0 or now_ms <= earliest_open_ms:
+        return 1
+    total_candles = max(1, (now_ms - earliest_open_ms) // step)
+    return max(1, math.ceil(total_candles / 1000))
+
+
 def _fetch_all_klines_via_rest(
     *,
     client: httpx.Client,
@@ -266,11 +287,22 @@ def _fetch_all_klines_via_rest(
     interval: str,
     start_ms: int = 0,
     end_ms: Optional[int] = None,
-) -> Tuple[int, Optional[int]]:
+    progress_cb: Optional[Callable[[int, int, float], None]] = None,
+    chunk_total_estimate: Optional[int] = None,
+) -> Tuple[int, Optional[int], int]:
+    """
+    return: (fetched_rows, last_open_ms, chunks)
+    """
     url = f"{BINANCE_API_BASE}{BINANCE_KLINES_PATH}"
     total = 0
     last_open: Optional[int] = None
     chunks = 0
+
+    if chunk_total_estimate is None:
+        try:
+            chunk_total_estimate = _estimate_chunk_total(symbol, interval, client)
+        except Exception:
+            chunk_total_estimate = None
 
     while True:
         params = {
@@ -294,6 +326,13 @@ def _fetch_all_klines_via_rest(
         start_ms = last_open + 1
         chunks += 1
 
+        if progress_cb:
+            if chunk_total_estimate and chunk_total_estimate > 0:
+                pct = min(100.0, (chunks / float(chunk_total_estimate)) * 100.0)
+            else:
+                pct = min(100.0, (chunks / 30.0) * 100.0)
+            progress_cb(chunks, chunk_total_estimate or 0, pct)
+
         if MAX_CHUNKS_PER_INTERVAL is not None and chunks >= MAX_CHUNKS_PER_INTERVAL:
             break
         if len(data) < 1000:
@@ -303,23 +342,7 @@ def _fetch_all_klines_via_rest(
         jitter_ms = random.randint(50, 150)
         time.sleep((base_ms + jitter_ms) / 1000.0)
 
-    return total, last_open
-
-
-def _run_backfill_for_symbol_interval(
-    client: httpx.Client, symbol: str, interval: str
-) -> Dict[str, Any]:
-    fetched, last_open = _fetch_all_klines_via_rest(
-        client=client, symbol=symbol, interval=interval, start_ms=0, end_ms=None
-    )
-    return {
-        "symbol": symbol,
-        "interval": interval,
-        "rows_fetched": fetched,
-        "last_open_ms": last_open,
-        "source": f"{BINANCE_API_BASE}{BINANCE_KLINES_PATH}",
-        "ok": True,
-    }
+    return total, last_open, chunks
 
 
 def _progress(
@@ -331,6 +354,9 @@ def _progress(
     symbol: str = "N/A",
     interval: Optional[str] = None,
     extra: Optional[Dict[str, Any]] = None,
+    chunk_current: Optional[int] = None,
+    chunk_total: Optional[int] = None,
+    chunk_pct: Optional[float] = None,
 ) -> None:
     meta: Dict[str, Any] = {
         "status": f"[{_TASK_SIGNATURE}] {status}",
@@ -343,7 +369,40 @@ def _progress(
         meta["interval"] = interval
     if extra:
         meta.update(extra)
+
+    if chunk_current is not None:
+        meta["chunk_current"] = int(chunk_current)
+    if chunk_total is not None:
+        meta["chunk_total"] = int(chunk_total)
+    if chunk_pct is not None:
+        meta["chunk_pct"] = float(chunk_pct)
+
     self.update_state(state="PROGRESS", meta=meta)
+
+
+def _run_backfill_for_symbol_interval(
+    client: httpx.Client, symbol: str, interval: str, progress_hook
+) -> Dict[str, Any]:
+    def _chunk_cb(chunk_current: int, chunk_total: int, chunk_pct: float):
+        progress_hook(chunk_current, chunk_total, chunk_pct)
+
+    fetched, last_open, chunks = _fetch_all_klines_via_rest(
+        client=client,
+        symbol=symbol,
+        interval=interval,
+        start_ms=0,
+        end_ms=None,
+        progress_cb=_chunk_cb,
+    )
+    return {
+        "symbol": symbol,
+        "interval": interval,
+        "rows_fetched": fetched,
+        "last_open_ms": last_open,
+        "chunks": chunks,
+        "source": f"{BINANCE_API_BASE}{BINANCE_KLINES_PATH}",
+        "ok": True,
+    }
 
 
 @celery_app.task(
@@ -375,6 +434,9 @@ def backfill_symbol_all_intervals_task(
                 total=total,
                 symbol=normalized,
                 extra={"raw_symbol": symbol},
+                chunk_current=0,
+                chunk_total=0,
+                chunk_pct=0.0,
             )
 
             results: List[Dict[str, Any]] = []
@@ -386,11 +448,27 @@ def backfill_symbol_all_intervals_task(
                     total=total,
                     symbol=normalized,
                     interval=interval,
+                    chunk_current=0,
+                    chunk_total=0,
+                    chunk_pct=0.0,
                 )
 
-                time.sleep(random.uniform(0.05, 0.20))
+                def _hook(cc: int, ct: int, cp: float):
+                    _progress(
+                        self,
+                        status=f"{normalized} - {interval} 수집 중 (chunk {cc}/{ct or '?'})",
+                        current=idx - 1,
+                        total=total,
+                        symbol=normalized,
+                        interval=interval,
+                        chunk_current=cc,
+                        chunk_total=ct,
+                        chunk_pct=cp,
+                    )
 
-                res = _run_backfill_for_symbol_interval(client, normalized, interval)
+                res = _run_backfill_for_symbol_interval(
+                    client, normalized, interval, progress_hook=_hook
+                )
                 results.append(res)
 
                 _progress(
@@ -400,6 +478,9 @@ def backfill_symbol_all_intervals_task(
                     total=total,
                     symbol=normalized,
                     interval=interval,
+                    chunk_current=res.get("chunks", 0),
+                    chunk_total=res.get("chunks", 0),
+                    chunk_pct=100.0,
                 )
 
         return {

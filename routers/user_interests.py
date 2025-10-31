@@ -7,7 +7,7 @@ from typing import List
 from db_module.connect_sqlalchemy_engine import get_async_db
 from models import User
 
-from core import auth
+from services import auth
 
 router = APIRouter(prefix="/user", tags=["User"])
 

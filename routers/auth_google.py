@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 
 from db_module.connect_sqlalchemy_engine import get_async_db
 from models import User
-from core import auth
+from services import auth
 
 router = APIRouter(prefix="/auth/google", tags=["Authentication (Google)"])
 

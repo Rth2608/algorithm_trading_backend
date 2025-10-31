@@ -2,6 +2,10 @@ from fastapi import FastAPI
 from routers import auth_google, admin, ohlcv_rest
 from fastapi.middleware.cors import CORSMiddleware
 
+
+import models
+from models.base import Base
+
 app = FastAPI(title="DB backend")
 
 

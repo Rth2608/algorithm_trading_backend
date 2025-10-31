@@ -1,10 +1,19 @@
 from __future__ import annotations
 from datetime import datetime
-from sqlalchemy import SmallInteger, TIMESTAMP, Numeric, Boolean, Enum, ForeignKey, func
+
+from sqlalchemy import (
+    String,
+    TIMESTAMP,
+    Numeric,
+    Boolean,
+    Enum,
+    ForeignKey,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column
+
 from .base import Base
 
-# DB의 타입: trading_data.ohlcv_source ENUM('REST','WS') 에 직접 매핑
 ohlcv_source_enum = Enum(
     "REST",
     "WS",
@@ -14,18 +23,20 @@ ohlcv_source_enum = Enum(
 
 
 class _OhlcvBase(Base):
-    """공통 컬럼(복합 PK: symbol_id, timestamp)"""
+    """공통 컬럼(복합 PK: symbol, timestamp)"""
 
     __abstract__ = True
     __table_args__ = {"schema": "trading_data"}
 
-    symbol_id: Mapped[int] = mapped_column(
-        SmallInteger,
-        ForeignKey("metadata.crypto_info.symbol_id", ondelete="CASCADE"),
+    symbol: Mapped[str] = mapped_column(
+        String(30),
+        ForeignKey("metadata.crypto_info.symbol", ondelete="CASCADE"),
         primary_key=True,
     )
     timestamp: Mapped[datetime] = mapped_column(
-        "timestamp", TIMESTAMP(timezone=True), primary_key=True
+        "timestamp",
+        TIMESTAMP(timezone=True),
+        primary_key=True,
     )
 
     open: Mapped[float] = mapped_column(Numeric(20, 7), nullable=False)
@@ -35,10 +46,9 @@ class _OhlcvBase(Base):
 
     volume: Mapped[float] = mapped_column(Numeric(20, 3), nullable=False)
 
-    # DB enum 사용
     src: Mapped[str] = mapped_column(ohlcv_source_enum, nullable=False, default="REST")
-
     is_ended: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
     updated_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True),
         nullable=False,
@@ -47,7 +57,6 @@ class _OhlcvBase(Base):
     )
 
 
-# 각 인터벌별 테이블
 class Ohlcv1m(_OhlcvBase):
     __tablename__ = "ohlcv_1m"
 
