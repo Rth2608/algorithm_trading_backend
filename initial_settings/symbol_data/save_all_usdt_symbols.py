@@ -1,10 +1,9 @@
-# 2025-10-06-09:00 기준 현재 저장됨
-
 import os
 import requests
 import pandas as pd
 
 REST_URL = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+
 
 def save_all_symbols_by_volume():
     """Binance 선물 거래소의 모든 USDT 기반 심볼을 거래대금 순으로 CSV로 저장 (symbol만 저장)"""

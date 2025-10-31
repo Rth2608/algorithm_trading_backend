@@ -9,3 +9,12 @@ python-dotenv
 websocket-client
 ta
 tqdm
+httpx
+authlib
+pydantic[email]
+loguru
+python-jose[cryptography]
+celery
+redis
+aiohttp
+aiolimiter
