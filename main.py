@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from routers import auth_google, admin, ohlcv_rest
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="Google Login Only API")
+app = FastAPI(title="DB backend")
 
 
 origins = [
@@ -25,4 +25,4 @@ app.include_router(ohlcv_rest.router)
 
 @app.get("/")
 def root():
-    return {"msg": "Google Login API is running"}
+    return {"msg": "DB backend"}

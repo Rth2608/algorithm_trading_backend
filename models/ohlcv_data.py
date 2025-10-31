@@ -1,4 +1,3 @@
-# models/ohlcv_data.py
 from __future__ import annotations
 from datetime import datetime
 from sqlalchemy import SmallInteger, TIMESTAMP, Numeric, Boolean, Enum, ForeignKey, func
@@ -18,7 +17,7 @@ class _OhlcvBase(Base):
     """공통 컬럼(복합 PK: symbol_id, timestamp)"""
 
     __abstract__ = True
-    __table_args__ = {"schema": "trading_data"}  # ✅ 모든 파생 클래스에 스키마 적용
+    __table_args__ = {"schema": "trading_data"}
 
     symbol_id: Mapped[int] = mapped_column(
         SmallInteger,

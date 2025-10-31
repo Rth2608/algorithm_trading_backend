@@ -7,7 +7,7 @@ from typing import List
 from db_module.connect_sqlalchemy_engine import get_async_db
 from models import User
 
-from core import auth  # 4번 auth.py 파일
+from core import auth
 
 router = APIRouter(prefix="/user", tags=["User"])
 
@@ -24,7 +24,7 @@ async def register_complete(
     db: AsyncSession = Depends(get_async_db),
     current_user: User = Depends(auth.get_current_user),
 ):
-    """현재 로그인된 유저의 관심 종목 및 이메일 수신 동의를 업데이트합니다."""
+    """로그인된 유저의 이메일 수신 동의 및 이용약관 등 업데이트"""
 
     current_user.email_opt_in = payload.email_opt_in
 
