@@ -1,22 +1,42 @@
-from __future__ import annotations
-
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from celery.result import AsyncResult  # ← 필요
+from celery.result import AsyncResult
 
 from db_module.connect_sqlalchemy_engine import get_async_db
 from models import CryptoInfo
 
-from tasks.backfill_tasks import (
-    celery_app,
-    backfill_symbol_all_intervals_task,
-    normalize_symbol,
-)
+from tasks.backfill_tasks import celery_app
+from tasks.backfill_tasks import backfill_all
+
+import os
+from redis.asyncio import from_url as redis_from_url
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+ACTIVE_HASH_KEY = os.getenv("ACTIVE_HASH_KEY", "ohlcv:active_jobs")
 
 router = APIRouter(prefix="/ohlcv/rest", tags=["OHLCV-REST"])
+
+_redis = redis_from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
+
+
+async def _active_put(symbol: str, job_id: str) -> None:
+    await _redis.hset(ACTIVE_HASH_KEY, symbol, job_id)
+
+
+async def _active_remove(symbol: str) -> None:
+    await _redis.hdel(ACTIVE_HASH_KEY, symbol)
+
+
+async def _active_all() -> Dict[str, str]:
+    data = await _redis.hgetall(ACTIVE_HASH_KEY)
+    return data or {}
+
+
+def _default_intervals(intervals: Optional[List[str]]) -> List[str]:
+    return intervals or ["1m", "5m", "15m", "1h", "4h", "1d"]
 
 
 async def _load_all_symbols(db: AsyncSession) -> List[str]:
@@ -30,17 +50,28 @@ def _serialize_task(ar: AsyncResult) -> Dict[str, Any]:
     except Exception:
         state = "PENDING"
 
-    status = ""
-    current = 0
-    total = 0
-    interval_percentage = 0.0
-    error_info: Optional[str] = None
-    symbol: Optional[str] = None
-    interval: Optional[str] = None
+    payload: Dict[str, Any] = {
+        "state": state,
+        "status": "",
+        "current": 0,
+        "total": 0,
+        "pct_intervals": 0.0,
+        "symbol": None,
+        "interval": None,
+        "pct_time": 0.0,
+        "last_updated_ms": None,
+        "last_updated_iso": None,
+        "latest_open_ms": None,
+        "latest_open_iso": None,
+        "error_info": None,
+        "result": None,
+    }
 
-    chunk_current: Optional[int] = None
-    chunk_total: Optional[int] = None
-    chunk_pct: Optional[float] = None
+    if state == "SUCCESS":
+        try:
+            payload["result"] = ar.result
+        except Exception:
+            payload["result"] = None
 
     try:
         meta = ar.info
@@ -48,82 +79,78 @@ def _serialize_task(ar: AsyncResult) -> Dict[str, Any]:
         meta = None
 
     if isinstance(meta, dict):
-        status = str(meta.get("status") or "")
-        try:
-            current = int(meta.get("current") or 0)
-        except Exception:
-            current = 0
-        try:
-            total = int(meta.get("total") or 0)
-        except Exception:
-            total = 0
-        try:
-            interval_percentage = float(meta.get("interval_percentage") or 0.0)
-        except Exception:
-            interval_percentage = 0.0
+        payload["status"] = str(meta.get("status") or "")
+        for k, cast, dst in [
+            ("current", int, "current"),
+            ("total", int, "total"),
+            ("pct_intervals", float, "pct_intervals"),
+            ("pct_time", float, "pct_time"),
+        ]:
+            v = meta.get(k)
+            if v is not None:
+                try:
+                    payload[dst] = cast(v)
+                except Exception:
+                    pass
 
-        symbol = meta.get("symbol")
-        interval = meta.get("interval")
+        payload["symbol"] = meta.get("symbol")
+        payload["interval"] = meta.get("interval")
 
-        try:
-            chunk_current = (
-                int(meta.get("chunk_current"))
-                if meta.get("chunk_current") is not None
-                else None
-            )
-        except Exception:
-            chunk_current = None
-        try:
-            chunk_total = (
-                int(meta.get("chunk_total"))
-                if meta.get("chunk_total") is not None
-                else None
-            )
-        except Exception:
-            chunk_total = None
-        try:
-            chunk_pct = (
-                float(meta.get("chunk_pct"))
-                if meta.get("chunk_pct") is not None
-                else None
-            )
-        except Exception:
-            chunk_pct = None
+        lu_ms = meta.get("last_updated_ms")
+        if lu_ms is not None:
+            try:
+                payload["last_updated_ms"] = int(lu_ms)
+            except Exception:
+                pass
+        payload["last_updated_iso"] = meta.get("last_updated_iso")
+
+        lo_ms = meta.get("latest_open_ms")
+        if lo_ms is not None:
+            try:
+                payload["latest_open_ms"] = int(lo_ms)
+            except Exception:
+                pass
+        payload["latest_open_iso"] = meta.get("latest_open_iso")
 
         if state == "FAILURE":
-            error_info = meta.get("exc_message") or meta.get("error") or str(meta)
+            payload["error_info"] = (
+                meta.get("exc_message") or meta.get("error") or str(meta)
+            )
     else:
         if state == "FAILURE":
-            error_info = str(meta) if meta is not None else "Unknown error"
+            try:
+                payload["error_info"] = (
+                    str(meta) if meta is not None else "Unknown error"
+                )
+            except Exception:
+                payload["error_info"] = "Unknown error"
 
-    if (
-        (chunk_pct is None or chunk_pct == 0.0)
-        and chunk_current is not None
-        and chunk_total
-        and chunk_total > 0
-    ):
+    return payload
+
+
+async def _prune_finished_active() -> Dict[str, str]:
+    """
+    Redis의 진행중 목록에서 완료(SUCCESS/FAILURE/REVOKED)된 것 제거
+    남은 {symbol: job_id}를 반환
+    """
+    mapping = await _active_all()
+    if not mapping:
+        return {}
+
+    to_delete: List[str] = []
+    for symbol, jid in mapping.items():
         try:
-            chunk_pct = min(100.0, (float(chunk_current) / float(chunk_total)) * 100.0)
+            ar = celery_app.AsyncResult(jid)
+            st = ar.state or "PENDING"
         except Exception:
-            chunk_pct = 0.0
+            st = "PENDING"
+        if st in ("SUCCESS", "FAILURE", "REVOKED"):
+            to_delete.append(symbol)
 
-    return {
-        "state": state,
-        "status": status,
-        "current": current,
-        "total": total,
-        "interval_percentage": interval_percentage,
-        "error_info": error_info,
-        "symbol": symbol,
-        "interval": interval,
-        "chunk_current": chunk_current or 0,
-        "chunk_total": chunk_total or 0,
-        "chunk_pct": chunk_pct or 0.0,
-    }
+    if to_delete:
+        await _redis.hdel(ACTIVE_HASH_KEY, *to_delete)
 
-
-def _default_intervals(intervals: Optional[List[str]]) -> List[str]:
-    return intervals or ["1m", "5m", "15m", "1h", "4h", "1d"]
+    return await _active_all()
 
 
 @router.post("/backfill/all-symbols")
@@ -131,27 +158,32 @@ async def trigger_backfill_all_symbols(
     intervals: Optional[List[str]] = Body(default=None, embed=True),
     db: AsyncSession = Depends(get_async_db),
 ):
+    """
+    metadata.crypto_info 내 모든 심볼 대상 백필 큐잉
+    (각 종목은 'USDT'를 붙여 Binance로 호출)
+    """
     symbols = await _load_all_symbols(db)
     if not symbols:
-        raise HTTPException(status_code=404, detail="등록된 심볼이 없습니다.")
+        raise HTTPException(status_code=404, detail="표시할 종목 정보가 없습니다.")
 
-    use_intervals = _default_intervals(intervals)
+    using_intervals = _default_intervals(intervals)
 
     job_ids: List[str] = []
     symbol_job_map: Dict[str, str] = {}
 
     for raw in symbols:
-        norm = normalize_symbol(raw)
-        ar = backfill_symbol_all_intervals_task.apply_async(
-            kwargs={"symbol": norm, "intervals": use_intervals}
+        norm_api_symbol = raw.upper().strip().replace(" ", "") + "USDT"
+        ar = backfill_all.apply_async(
+            kwargs={"api_symbol": norm_api_symbol, "intervals": using_intervals}
         )
         job_ids.append(ar.id)
         symbol_job_map[raw] = ar.id
+        await _active_put(raw, ar.id)
 
     return {
         "message": "queued",
         "symbols_count": len(symbols),
-        "intervals": use_intervals,
+        "intervals": using_intervals,
         "job_ids": job_ids,
         "symbol_job_map": symbol_job_map,
     }
@@ -162,32 +194,61 @@ async def trigger_backfill_symbol(
     symbol: str = Body(..., embed=True),
     intervals: Optional[List[str]] = Body(default=None, embed=True),
 ):
+    """
+    단일 심볼 백필 큐잉
+    """
     use_intervals = _default_intervals(intervals)
-    norm = normalize_symbol(symbol)
+    norm_api_symbol = symbol.upper().strip().replace(" ", "") + "USDT"
 
-    ar = backfill_symbol_all_intervals_task.apply_async(
-        kwargs={"symbol": norm, "intervals": use_intervals}
+    ar = backfill_all.apply_async(
+        kwargs={"api_symbol": norm_api_symbol, "intervals": use_intervals}
     )
+    await _active_put(symbol.upper().strip(), ar.id)
+
     return {
         "message": "queued",
         "symbol_input": symbol,
-        "symbol_used": norm,
+        "symbol_used": norm_api_symbol,
         "intervals": use_intervals,
         "job_id": ar.id,
     }
 
 
-@router.get("/status/{job_id}")
-async def get_task_status(job_id: str):
-    ar = celery_app.AsyncResult(job_id)
-    payload = _serialize_task(ar)
-    return {"job_id": job_id, **payload}
+@router.get("/status/active")
+async def get_active_jobs_status():
+    """
+    새로고침 시 진행 중 작업을 복구하기 위한 엔드포인트
+    Redis에서 {symbol: job_id}를 가져와 상태를 직렬화
+    완료된 job은 즉시 정리 후 반환
+    """
+    mapping = await _prune_finished_active()
+    if not mapping:
+        return {"job_ids": [], "symbol_job_map": {}, "items": []}
+
+    items: List[Dict[str, Any]] = []
+    for sym, jid in mapping.items():
+        ar = celery_app.AsyncResult(jid)
+        payload = _serialize_task(ar)
+        if not payload.get("symbol"):
+            payload["symbol"] = sym
+        items.append({"job_id": jid, **payload})
+
+    return {
+        "job_ids": list(mapping.values()),
+        "symbol_job_map": mapping,
+        "items": items,
+    }
 
 
 @router.post("/status/bulk")
 async def get_task_status_bulk(job_ids: List[str] = Body(..., embed=True)):
+    """
+    여러 job_id를 한 번에 조회
+    """
     if not job_ids:
-        raise HTTPException(status_code=422, detail="job_ids가 비어 있습니다.")
+        raise HTTPException(
+            status_code=422, detail="조회할 작업이 선택되지 않았습니다."
+        )
 
     items: List[Dict[str, Any]] = []
     for jid in job_ids:
@@ -200,3 +261,13 @@ async def get_task_status_bulk(job_ids: List[str] = Body(..., embed=True)):
         "done": sum(1 for x in items if x.get("state") in ("SUCCESS", "FAILURE")),
     }
     return {"summary": summary, "items": items}
+
+
+@router.get("/status/{job_id}")
+async def get_task_status(job_id: str):
+    """
+    특정 job_id의 상태/진행률/결과 조회
+    """
+    ar = celery_app.AsyncResult(job_id)
+    payload = _serialize_task(ar)
+    return {"job_id": job_id, **payload}

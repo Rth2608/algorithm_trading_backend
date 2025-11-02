@@ -1,54 +1,80 @@
-from __future__ import annotations
-
 import os
 import time
-import math
-import random
-from collections import deque
-from typing import Any, Dict, List, Optional, Tuple, Set, Callable
+from typing import Any, Dict, List, Optional, Tuple, Callable
+from datetime import datetime, timezone
+from loguru import logger
 
 from celery import Celery
-import httpx
+from sqlalchemy.orm import Session as SyncSession
+from sqlalchemy import select, func
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-BINANCE_API_BASE = os.environ.get("BINANCE_API_BASE", "https://fapi.binance.com")
-BINANCE_KLINES_PATH = os.environ.get("BINANCE_KLINES_PATH", "/fapi/v1/klines")
-BINANCE_EXCHANGE_INFO_PATH = os.environ.get(
+import redis
+
+from db_module.connect_sqlalchemy_engine import SyncSessionLocal
+from api_module.weight_pacer import (
+    update_speed_by_weight,
+    pace_next_request_by_used_weight,
+)
+from models.ohlcv_data import Ohlcv1m, Ohlcv5m, Ohlcv15m, Ohlcv1h, Ohlcv4h, Ohlcv1d
+from api_module.redis_limiter import RedisWindowLimiter
+from api_module.http_client import BinanceHttpClient
+from api_module.binance_meta import load_fapi_symbols
+
+_MS_PER_INTERVAL: Dict[str, int] = {
+    "1m": 60_000,
+    "5m": 300_000,
+    "15m": 900_000,
+    "1h": 3_600_000,
+    "4h": 14_400_000,
+    "1d": 86_400_000,
+}
+MODEL_MAP = {
+    "1m": Ohlcv1m,
+    "5m": Ohlcv5m,
+    "15m": Ohlcv15m,
+    "1h": Ohlcv1h,
+    "4h": Ohlcv4h,
+    "1d": Ohlcv1d,
+}
+_TASK_SIGNATURE = "Rest Api"
+
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "20"))
+BINANCE_API_BASE = os.getenv("BINANCE_API_BASE", "https://fapi.binance.com")
+BINANCE_REST_KLINES_PATH = os.getenv("BINANCE_REST_KLINES_PATH", "/fapi/v1/klines")
+BINANCE_EXCHANGE_INFO_PATH = os.getenv(
     "BINANCE_EXCHANGE_INFO_PATH", "/fapi/v1/exchangeInfo"
 )
+BINANCE_SERVER_TIME_PATH = "/fapi/v1/time"
 
-DEFAULT_QUOTE = os.environ.get("DEFAULT_QUOTE", "USDT")
-ALLOWED_QUOTES = os.environ.get(
-    "ALLOWED_QUOTES", "USDT,USDC,BUSD,FDUSD,TRY,EUR,BRL"
-).split(",")
+RESTAPI_URL = f"{BINANCE_API_BASE}{BINANCE_REST_KLINES_PATH}"
+EXCHANGE_INFO_URL = f"{BINANCE_API_BASE}{BINANCE_EXCHANGE_INFO_PATH}"
+SERVER_TIME_URL = f"{BINANCE_API_BASE}{BINANCE_SERVER_TIME_PATH}"
 
-HTTP_TIMEOUT = float(os.environ.get("HTTP_TIMEOUT", "20"))
+BINANCE_GLOBAL_MAX_RPS = int(os.getenv("BINANCE_GLOBAL_MAX_RPS", "8"))
+BINANCE_GLOBAL_MAX_RPM = int(os.getenv("BINANCE_GLOBAL_MAX_RPM", "400"))
+BINANCE_WEIGHT_LIMIT_1M = int(os.getenv("BINANCE_WEIGHT_LIMIT_1M", "2400"))
+BINANCE_WEIGHT_SLOWDOWN_RATIO = float(os.getenv("BINANCE_WEIGHT_SLOWDOWN_RATIO", "0.8"))
+BINANCE_MAX_RETRIES = int(os.getenv("BINANCE_MAX_RETRIES", "4"))
+BINANCE_BACKOFF_BASE_SEC = float(os.getenv("BINANCE_BACKOFF_BASE_SEC", "0.5"))
 
-BINANCE_LOCAL_MAX_RPS = int(os.environ.get("BINANCE_LOCAL_MAX_RPS", "15"))
-BINANCE_LOCAL_MAX_RPM = int(os.environ.get("BINANCE_LOCAL_MAX_RPM", "600"))
-BINANCE_GLOBAL_MAX_RPS = int(os.environ.get("BINANCE_GLOBAL_MAX_RPS", "20"))
-BINANCE_GLOBAL_MAX_RPM = int(os.environ.get("BINANCE_GLOBAL_MAX_RPM", "900"))
-BINANCE_WEIGHT_LIMIT_1M = int(os.environ.get("BINANCE_WEIGHT_LIMIT_1M", "2400"))
-BINANCE_WEIGHT_SLOWDOWN_RATIO = float(
-    os.environ.get("BINANCE_WEIGHT_SLOWDOWN_RATIO", "0.80")
-)
-
-BINANCE_MAX_RETRIES = int(os.environ.get("BINANCE_MAX_RETRIES", "6"))
-BINANCE_BACKOFF_BASE_SEC = float(os.environ.get("BINANCE_BACKOFF_BASE_SEC", "1.0"))
-BINANCE_CHUNK_PAUSE_MS = int(os.environ.get("BINANCE_CHUNK_PAUSE_MS", "250"))
-
-MAX_CHUNKS_PER_INTERVAL: Optional[int] = (
-    int(os.environ["MAX_CHUNKS_PER_INTERVAL"])
-    if "MAX_CHUNKS_PER_INTERVAL" in os.environ
-    else None
-)
-
-REDIS_URL = os.environ.get(
-    "REDIS_URL", os.environ.get("CELERY_BROKER_URL", "redis://redis:6379/0")
-)
+REDIS_URL = os.environ.get("REDIS_URL")
 REDIS_RATE_KEY_PREFIX = os.environ.get("REDIS_RATE_KEY_PREFIX", "binance:rate")
 
-CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL", "redis://redis:6379/0")
-CELERY_RESULT_BACKEND = os.environ.get("CELERY_RESULT_BACKEND", "redis://redis:6379/0")
+# 진행 중 작업을 보관할 키(해시: symbol -> job_id), TTL은 키에 걸지 않고 heartbeat로 주기 갱신
+ACTIVE_HASH_KEY = os.environ.get("ACTIVE_HASH_KEY", "ohlcv:active_jobs")
+# 각 종에 별도 TTL을 줄 수 없으니, 보조로 set을 두고 마지막 하트비트 epoch(ms)도 저장
+ACTIVE_TS_HASH_KEY = os.environ.get("ACTIVE_TS_HASH_KEY", "ohlcv:active_jobs_ts")
+ACTIVE_STALE_MS = int(
+    os.environ.get("ACTIVE_STALE_MS", str(10 * 60 * 1000))
+)  # 10분간 하트비트 없으면 stale
+
+_redis: Optional[redis.Redis] = (
+    redis.Redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
+)
+
+CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL")
+CELERY_RESULT_BACKEND = os.environ.get("CELERY_RESULT_BACKEND")
 
 celery_app = Celery(
     "backfill_tasks", broker=CELERY_BROKER_URL, backend=CELERY_RESULT_BACKEND
@@ -61,252 +87,119 @@ celery_app.conf.update(
     result_extended=True,
 )
 
-_TASK_SIGNATURE = "v3-dist-rl+weight-aware"
 
-_FAPI_SYMBOLS_CACHE: Optional[Set[str]] = None
-
-
-class _LocalLimiter:
-    def __init__(self, max_rps: int, max_rpm: int):
-        self.max_rps = max_rps
-        self.max_rpm = max_rpm
-        self._sec_q = deque()
-        self._min_q = deque()
-
-    def acquire(self) -> None:
-        now = time.monotonic()
-        s_ago = now - 1.0
-        m_ago = now - 60.0
-        while self._sec_q and self._sec_q[0] <= s_ago:
-            self._sec_q.popleft()
-        while self._min_q and self._min_q[0] <= m_ago:
-            self._min_q.popleft()
-
-        while len(self._sec_q) >= self.max_rps or len(self._min_q) >= self.max_rpm:
-            now = time.monotonic()
-            s_ago = now - 1.0
-            m_ago = now - 60.0
-            ws = 0.0 if len(self._sec_q) < self.max_rps else (self._sec_q[0] - s_ago)
-            wm = 0.0 if len(self._min_q) < self.max_rpm else (self._min_q[0] - m_ago)
-            time.sleep(max(ws, wm) + 0.005)
-            while self._sec_q and self._sec_q[0] <= (time.monotonic() - 1.0):
-                self._sec_q.popleft()
-            while self._min_q and self._min_q[0] <= (time.monotonic() - 60.0):
-                self._min_q.popleft()
-
-        t = time.monotonic()
-        self._sec_q.append(t)
-        self._min_q.append(t)
+def _symbol_api_to_db(symbol: str) -> str:
+    return symbol[:-4] if symbol.endswith("USDT") else symbol
 
 
-_LOCAL_RL = _LocalLimiter(BINANCE_LOCAL_MAX_RPS, BINANCE_LOCAL_MAX_RPM)
-
-
-_redis = None
-try:
-    import redis
-
-    _redis = redis.Redis.from_url(
-        REDIS_URL, socket_connect_timeout=1.5, socket_timeout=1.5
+def _fmt_iso_utc(ms: int) -> str:
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
     )
-    _redis.ping()
-except Exception:
-    _redis = None
 
 
-def _redis_incr_with_ttl(key: str, limit: int, ttl: int) -> bool:
-    if _redis is None:
-        return True
-    pipe = _redis.pipeline()
-    try:
-        pipe.incr(key)
-        pipe.expire(key, ttl)
-        cur, _ = pipe.execute()
-        cur = int(cur or 0)
-        if cur > limit:
-            try:
-                _redis.decr(key)
-            except Exception:
-                pass
-            return False
-        return True
-    except Exception:
-        return True
+def _last_closed_open_ms(server_ms: int, step_ms: int) -> int:
+    current_candle_open_ms = (server_ms // step_ms) * step_ms
+    return current_candle_open_ms - step_ms
 
 
-def _global_acquire() -> None:
-    if _redis is None:
+def _percent_by_time(
+    start_ms_base: int, latest_open_ms: int, server_ms_snapshot: int, step_ms: int
+) -> float:
+    last_closed = _last_closed_open_ms(server_ms_snapshot, step_ms)
+    if last_closed <= start_ms_base:
+        return 100.0
+    done = max(0, latest_open_ms - start_ms_base)
+    total = last_closed - start_ms_base
+    return max(0.0, min(100.0, (done / total) * 100.0))
+
+
+def _get_server_time_ms(http: BinanceHttpClient) -> int:
+    r = http.get_once(SERVER_TIME_URL, params=None)
+    j = r.json()
+    return int(j["serverTime"])
+
+
+def _get_start_ms_from_db(db: SyncSession, api_symbol: str, interval: str) -> int:
+    OhlcvModel = MODEL_MAP[interval]
+    symbol = _symbol_api_to_db(api_symbol)
+    last_timestamp = db.execute(
+        select(func.max(OhlcvModel.timestamp)).where(OhlcvModel.symbol == symbol)
+    ).scalar_one_or_none()
+    if last_timestamp is None:
+        return 0
+    return int(last_timestamp.timestamp() * 1000)
+
+
+def _rows_from_klines(api_symbol: str, data: List[list]) -> List[Dict[str, Any]]:
+    base_symbol = _symbol_api_to_db(api_symbol)
+    rows: List[Dict[str, Any]] = []
+    for k in data:
+        open_ms = int(k[0])
+        rows.append(
+            {
+                "symbol": base_symbol,
+                "timestamp": datetime.fromtimestamp(open_ms / 1000, tz=timezone.utc),
+                "open": float(k[1]),
+                "high": float(k[2]),
+                "low": float(k[3]),
+                "close": float(k[4]),
+                "volume": float(k[5]),
+            }
+        )
+    return rows
+
+
+def _bulk_upsert(session: SyncSession, model, rows: List[Dict[str, Any]]) -> int:
+    if not rows:
+        return 0
+    stmt = pg_insert(model).values(rows)
+    stmt = stmt.on_conflict_do_nothing(index_elements=["symbol", "timestamp"])
+    result = session.execute(stmt)
+    session.commit()
+    return result.rowcount or 0
+
+
+def _active_heartbeat(symbol: str, job_id: str):
+    if not _redis:
         return
-
-    while True:
-        now = time.time()
-        sec_key = f"{REDIS_RATE_KEY_PREFIX}:sec:{int(now)}"
-        min_key = f"{REDIS_RATE_KEY_PREFIX}:min:{int(now // 60)}"
-
-        ok_sec = _redis_incr_with_ttl(sec_key, BINANCE_GLOBAL_MAX_RPS, 2)
-        ok_min = _redis_incr_with_ttl(min_key, BINANCE_GLOBAL_MAX_RPM, 120)
-
-        if ok_sec and ok_min:
-            return
-
-        now = time.time()
-        sleep_sec = 0.0
-        if not ok_sec:
-            sleep_sec = max(sleep_sec, 1.0 - (now - math.floor(now)))
-        if not ok_min:
-            sec_into_min = int(now) % 60
-            sleep_sec = max(sleep_sec, 60 - sec_into_min + 0.01)
-        time.sleep(min(sleep_sec + 0.01, 1.2))
+    now_ms = int(time.time() * 1000)
+    _redis.hset(ACTIVE_HASH_KEY, symbol, job_id)
+    _redis.hset(ACTIVE_TS_HASH_KEY, symbol, str(now_ms))
 
 
-def normalize_symbol(raw: str) -> str:
-    s = raw.upper().strip().replace(" ", "")
-    if any(s.endswith(q.upper()) for q in ALLOWED_QUOTES):
-        return s
-    return f"{s}{DEFAULT_QUOTE.upper()}"
-
-
-def _update_speed_by_weight(headers: Dict[str, str]) -> None:
+def _active_clear(symbol: str, job_id: str):
+    if not _redis:
+        return
     try:
-        used = headers.get("X-MBX-USED-WEIGHT-1M") or headers.get("X-MBX-USED-WEIGHT")
-        if not used:
-            return
-        used = int(str(used).strip())
-        if used >= int(BINANCE_WEIGHT_LIMIT_1M * BINANCE_WEIGHT_SLOWDOWN_RATIO):
-            extra_ms = random.randint(400, 900)
-            time.sleep(extra_ms / 1000.0)
+        cur = _redis.hget(ACTIVE_HASH_KEY, symbol)
+        if cur == job_id:
+            _redis.hdel(ACTIVE_HASH_KEY, symbol)
+            _redis.hdel(ACTIVE_TS_HASH_KEY, symbol)
     except Exception:
         pass
 
 
-def _load_fapi_symbols(client: httpx.Client) -> Set[str]:
-    global _FAPI_SYMBOLS_CACHE
-    if _FAPI_SYMBOLS_CACHE is not None:
-        return _FAPI_SYMBOLS_CACHE
-    url = f"{BINANCE_API_BASE}{BINANCE_EXCHANGE_INFO_PATH}"
-
-    _global_acquire()
-    _LOCAL_RL.acquire()
-    resp = client.get(url)
-    if resp.status_code == 429:
-        ra = resp.headers.get("Retry-After")
-        time.sleep(float(ra) if ra else 2.0)
-        _global_acquire()
-        _LOCAL_RL.acquire()
-        resp = client.get(url)
-
-    resp.raise_for_status()
-    data = resp.json()
-    syms: Set[str] = set()
-    for item in data.get("symbols", []):
-        sym = str(item.get("symbol", "")).upper()
-        status = str(item.get("status", "")).upper()
-        if sym and status == "TRADING":
-            syms.add(sym)
-    _FAPI_SYMBOLS_CACHE = syms
-    return syms
-
-
-def _binance_get_with_retry(
-    client: httpx.Client, url: str, params: Dict[str, Any]
-) -> httpx.Response:
-    last_resp: Optional[httpx.Response] = None
-    for attempt in range(BINANCE_MAX_RETRIES + 1):
-        _global_acquire()
-        _LOCAL_RL.acquire()
-        resp = client.get(url, params=params)
-
-        _update_speed_by_weight(resp.headers)
-
-        if resp.status_code == 429 or "Too many requests" in resp.text:
-            ra = resp.headers.get("Retry-After")
-            if ra:
-                sleep_for = float(ra)
-            else:
-                sleep_for = (
-                    BINANCE_BACKOFF_BASE_SEC * (2**attempt)
-                ) + random.uniform(0, 0.35)
-            time.sleep(min(sleep_for, 60.0))
-            last_resp = resp
-            continue
-
-        try:
-            resp.raise_for_status()
-        except httpx.HTTPStatusError:
-            if 500 <= resp.status_code < 600 and attempt < BINANCE_MAX_RETRIES:
-                sleep_for = (
-                    BINANCE_BACKOFF_BASE_SEC * (2**attempt)
-                ) + random.uniform(0, 0.35)
-                time.sleep(min(sleep_for, 30.0))
-                last_resp = resp
-                continue
-            raise
-        return resp
-
-    sc = getattr(last_resp, "status_code", "N/A")
-    txt = last_resp.text[:300] if last_resp else ""
-    raise ValueError(
-        f"Klines HTTP {sc} (max retries exceeded) url='{url}', params={params}, text='{txt}'"
-    )
-
-
-_MS_PER_INTERVAL = {
-    "1m": 60_000,
-    "5m": 300_000,
-    "15m": 900_000,
-    "1h": 3_600_000,
-    "4h": 14_400_000,
-    "1d": 86_400_000,
-}
-
-
-def _estimate_chunk_total(symbol: str, interval: str, client: httpx.Client) -> int:
-    """대략적인 총 청크 수(= 1000캔들 단위)를 추정"""
-    url = f"{BINANCE_API_BASE}{BINANCE_KLINES_PATH}"
-    params = {"symbol": symbol, "interval": interval, "startTime": 0, "limit": 1}
-    _global_acquire()
-    _LOCAL_RL.acquire()
-    resp = client.get(url, params=params)
-    resp.raise_for_status()
-    arr = resp.json()
-    if not arr:
-        return 1
-    earliest_open_ms = int(arr[0][0])
-    now_ms = int(time.time() * 1000)
-    step = _MS_PER_INTERVAL.get(interval, 60_000)
-    if step <= 0 or now_ms <= earliest_open_ms:
-        return 1
-    total_candles = max(1, (now_ms - earliest_open_ms) // step)
-    return max(1, math.ceil(total_candles / 1000))
-
-
-def _fetch_all_klines_via_rest(
+def _fetch_all_klines_restapi(
     *,
-    client: httpx.Client,
-    symbol: str,
+    http: BinanceHttpClient,
+    db: SyncSession,
+    api_symbol: str,
     interval: str,
     start_ms: int = 0,
     end_ms: Optional[int] = None,
-    progress_cb: Optional[Callable[[int, int, float], None]] = None,
-    chunk_total_estimate: Optional[int] = None,
-) -> Tuple[int, Optional[int], int]:
-    """
-    return: (fetched_rows, last_open_ms, chunks)
-    """
-    url = f"{BINANCE_API_BASE}{BINANCE_KLINES_PATH}"
+    progress_cb: Optional[Callable[[float, int, int], None]] = None,
+) -> Tuple[int, Optional[int]]:
     total = 0
     last_open: Optional[int] = None
-    chunks = 0
-
-    if chunk_total_estimate is None:
-        try:
-            chunk_total_estimate = _estimate_chunk_total(symbol, interval, client)
-        except Exception:
-            chunk_total_estimate = None
+    start_ms_base = start_ms
+    step_ms = _MS_PER_INTERVAL[interval]
+    OhlcvModel = MODEL_MAP[interval]
 
     while True:
-        params = {
-            "symbol": symbol,
+        server_ms_snapshot = int(time.time() * 1000)
+        params: Dict[str, Any] = {
+            "symbol": api_symbol,
             "interval": interval,
             "limit": 1000,
             "startTime": start_ms,
@@ -314,35 +207,40 @@ def _fetch_all_klines_via_rest(
         if end_ms is not None:
             params["endTime"] = end_ms
 
-        resp = _binance_get_with_retry(client, url, params)
+        resp = http.get_with_retry(RESTAPI_URL, params)
         data = resp.json()
         if not isinstance(data, list):
-            raise RuntimeError(f"Unexpected response for {symbol}-{interval}: {data}")
+            raise RuntimeError(
+                f"Unexpected response for {api_symbol}-{interval}: {data}"
+            )
         if not data:
             break
+
+        rows = _rows_from_klines(api_symbol, data)
+        _ = _bulk_upsert(db, OhlcvModel, rows)
 
         total += len(data)
         last_open = int(data[-1][0])
         start_ms = last_open + 1
-        chunks += 1
 
+        last_updated_ms = int(time.time() * 1000)
+        pct = _percent_by_time(start_ms_base, last_open, server_ms_snapshot, step_ms)
         if progress_cb:
-            if chunk_total_estimate and chunk_total_estimate > 0:
-                pct = min(100.0, (chunks / float(chunk_total_estimate)) * 100.0)
-            else:
-                pct = min(100.0, (chunks / 30.0) * 100.0)
-            progress_cb(chunks, chunk_total_estimate or 0, pct)
+            try:
+                progress_cb(pct, last_updated_ms, last_open)
+            except Exception as e:
+                logger.debug("progress_cb error: {}", e)
 
-        if MAX_CHUNKS_PER_INTERVAL is not None and chunks >= MAX_CHUNKS_PER_INTERVAL:
-            break
         if len(data) < 1000:
             break
 
-        base_ms = BINANCE_CHUNK_PAUSE_MS
-        jitter_ms = random.randint(50, 150)
-        time.sleep((base_ms + jitter_ms) / 1000.0)
+        headers: Dict[str, str] = dict(resp.headers)
+        update_speed_by_weight(
+            headers, BINANCE_WEIGHT_LIMIT_1M, BINANCE_WEIGHT_SLOWDOWN_RATIO
+        )
+        pace_next_request_by_used_weight(headers, BINANCE_WEIGHT_LIMIT_1M)
 
-    return total, last_open, chunks
+    return total, last_open
 
 
 def _progress(
@@ -353,142 +251,172 @@ def _progress(
     total: int,
     symbol: str = "N/A",
     interval: Optional[str] = None,
-    extra: Optional[Dict[str, Any]] = None,
-    chunk_current: Optional[int] = None,
-    chunk_total: Optional[int] = None,
-    chunk_pct: Optional[float] = None,
+    pct_time: Optional[float] = None,
+    last_updated_ms: Optional[int] = None,
+    latest_open_ms: Optional[int] = None,
 ) -> None:
     meta: Dict[str, Any] = {
         "status": f"[{_TASK_SIGNATURE}] {status}",
         "current": int(current),
         "total": int(total),
-        "interval_percentage": float(0 if total == 0 else (current / total) * 100.0),
+        "pct_intervals": float(0 if total == 0 else (current / total) * 100.0),
         "symbol": symbol,
     }
     if interval is not None:
         meta["interval"] = interval
-    if extra:
-        meta.update(extra)
-
-    if chunk_current is not None:
-        meta["chunk_current"] = int(chunk_current)
-    if chunk_total is not None:
-        meta["chunk_total"] = int(chunk_total)
-    if chunk_pct is not None:
-        meta["chunk_pct"] = float(chunk_pct)
+    if pct_time is not None:
+        meta["pct_time"] = float(pct_time)
+    if last_updated_ms is not None:
+        meta["last_updated_ms"] = int(last_updated_ms)
+        meta["last_updated_iso"] = _fmt_iso_utc(last_updated_ms)
+    if latest_open_ms is not None:
+        meta["latest_open_ms"] = int(latest_open_ms)
+        meta["latest_open_iso"] = _fmt_iso_utc(latest_open_ms)
 
     self.update_state(state="PROGRESS", meta=meta)
 
 
 def _run_backfill_for_symbol_interval(
-    client: httpx.Client, symbol: str, interval: str, progress_hook
+    http: BinanceHttpClient,
+    db: SyncSession,
+    symbol: str,
+    interval: str,
+    progress_hook,
+    start_ms: int,
 ) -> Dict[str, Any]:
-    def _chunk_cb(chunk_current: int, chunk_total: int, chunk_pct: float):
-        progress_hook(chunk_current, chunk_total, chunk_pct)
+    def _time_cb(pct_time: float, last_updated_ms: int, latest_open_ms: int):
+        progress_hook(pct_time, last_updated_ms, latest_open_ms)
 
-    fetched, last_open, chunks = _fetch_all_klines_via_rest(
-        client=client,
-        symbol=symbol,
+    fetched, last_open = _fetch_all_klines_restapi(
+        http=http,
+        db=db,
+        api_symbol=symbol,
         interval=interval,
-        start_ms=0,
+        start_ms=start_ms,
         end_ms=None,
-        progress_cb=_chunk_cb,
+        progress_cb=_time_cb,
     )
     return {
         "symbol": symbol,
         "interval": interval,
         "rows_fetched": fetched,
         "last_open_ms": last_open,
-        "chunks": chunks,
-        "source": f"{BINANCE_API_BASE}{BINANCE_KLINES_PATH}",
+        "source": RESTAPI_URL,
         "ok": True,
     }
 
 
-@celery_app.task(
-    bind=True, name="tasks.backfill_tasks.backfill_symbol_all_intervals_task"
-)
-def backfill_symbol_all_intervals_task(
-    self, symbol: str, intervals: Optional[List[str]] = None, **kwargs
+@celery_app.task(bind=True, name="backfill_all")
+def backfill_all(
+    self, api_symbol: str, intervals: Optional[List[str]] = None
 ) -> Dict[str, Any]:
+    if intervals is None:
+        intervals = ["1m", "5m", "15m", "1h", "4h", "1d"]
+
+    limiter = RedisWindowLimiter(
+        redis_url=REDIS_URL,
+        prefix=REDIS_RATE_KEY_PREFIX,
+        max_rps=BINANCE_GLOBAL_MAX_RPS,
+        max_rpm=BINANCE_GLOBAL_MAX_RPM,
+    )
+
+    base_symbol = _symbol_api_to_db(api_symbol)
+    job_id = self.request.id or ""
+
+    _active_heartbeat(base_symbol, job_id)
+
     try:
-        if intervals is None:
-            intervals = kwargs.get("intervals")
-        if intervals is None:
-            intervals = ["1m", "5m", "15m", "1h", "4h", "1d"]
+        with BinanceHttpClient(
+            timeout=HTTP_TIMEOUT,
+            limiter=limiter,
+            weight_limit_1m=BINANCE_WEIGHT_LIMIT_1M,
+            slowdown_ratio=BINANCE_WEIGHT_SLOWDOWN_RATIO,
+            backoff_base_sec=BINANCE_BACKOFF_BASE_SEC,
+            max_retries=BINANCE_MAX_RETRIES,
+        ) as http:
 
-        normalized = normalize_symbol(symbol)
-
-        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
-            tradables = _load_fapi_symbols(client)
-            if normalized not in tradables:
+            tradables = load_fapi_symbols(http, EXCHANGE_INFO_URL)
+            if api_symbol not in tradables:
                 raise ValueError(
-                    f"[{_TASK_SIGNATURE}] Not tradable on fapi: raw='{symbol}', normalized='{normalized}'."
+                    f"[{_TASK_SIGNATURE}] '{api_symbol}'는 Binance Future에서 ohlcv 데이터를 제공하지 않습니다."
                 )
-
-            total = len(intervals)
-            _progress(
-                self,
-                status="시작",
-                current=0,
-                total=total,
-                symbol=normalized,
-                extra={"raw_symbol": symbol},
-                chunk_current=0,
-                chunk_total=0,
-                chunk_pct=0.0,
-            )
 
             results: List[Dict[str, Any]] = []
-            for idx, interval in enumerate(intervals, start=1):
+
+            with SyncSessionLocal() as db:
+                total = len(intervals)
                 _progress(
                     self,
-                    status=f"{normalized} - {interval} 수집 중",
-                    current=idx - 1,
+                    status="Starting",
+                    current=0,
                     total=total,
-                    symbol=normalized,
-                    interval=interval,
-                    chunk_current=0,
-                    chunk_total=0,
-                    chunk_pct=0.0,
+                    symbol=api_symbol,
+                    pct_time=0.0,
                 )
+                _active_heartbeat(base_symbol, job_id)
 
-                def _hook(cc: int, ct: int, cp: float):
+                for idx, interval in enumerate(intervals, start=1):
+                    start_ms = _get_start_ms_from_db(db, api_symbol, interval)
+
                     _progress(
                         self,
-                        status=f"{normalized} - {interval} 수집 중 (chunk {cc}/{ct or '?'})",
+                        status=f"{api_symbol} - {interval} 수집 시작",
                         current=idx - 1,
                         total=total,
-                        symbol=normalized,
+                        symbol=api_symbol,
                         interval=interval,
-                        chunk_current=cc,
-                        chunk_total=ct,
-                        chunk_pct=cp,
+                        pct_time=0.0,
                     )
+                    _active_heartbeat(base_symbol, job_id)
 
-                res = _run_backfill_for_symbol_interval(
-                    client, normalized, interval, progress_hook=_hook
-                )
-                results.append(res)
+                    def _hook(
+                        pct_time: float, last_updated_ms: int, latest_open_ms: int
+                    ):
+                        _progress(
+                            self,
+                            status=f"{api_symbol} - {interval} 수집 중",
+                            current=idx - 1,
+                            total=total,
+                            symbol=api_symbol,
+                            interval=interval,
+                            pct_time=pct_time,
+                            last_updated_ms=last_updated_ms,
+                            latest_open_ms=latest_open_ms,
+                        )
+                        _active_heartbeat(base_symbol, job_id)
 
-                _progress(
-                    self,
-                    status=f"{normalized} - {interval} 완료",
-                    current=idx,
-                    total=total,
-                    symbol=normalized,
-                    interval=interval,
-                    chunk_current=res.get("chunks", 0),
-                    chunk_total=res.get("chunks", 0),
-                    chunk_pct=100.0,
-                )
+                    res = _run_backfill_for_symbol_interval(
+                        http=http,
+                        db=db,
+                        symbol=api_symbol,
+                        interval=interval,
+                        progress_hook=_hook,
+                        start_ms=start_ms,
+                    )
+                    results.append(res)
+
+                    latest_open_ms = res.get("last_open_ms") or 0
+                    now_ms = int(time.time() * 1000)
+
+                    _progress(
+                        self,
+                        status=f"{api_symbol} - {interval} 완료",
+                        current=idx,
+                        total=total,
+                        symbol=api_symbol,
+                        interval=interval,
+                        pct_time=100.0,
+                        last_updated_ms=now_ms,
+                        latest_open_ms=latest_open_ms,
+                    )
+                    _active_heartbeat(base_symbol, job_id)
 
         return {
             "task_signature": _TASK_SIGNATURE,
-            "symbol": normalized,
-            "total_intervals": total,
+            "symbol": api_symbol,
+            "total_intervals": len(intervals),
             "results": results,
             "status": "done",
         }
-    except Exception as e:
-        raise e
+    finally:
+        _active_clear(base_symbol, job_id)
