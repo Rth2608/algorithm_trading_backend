@@ -61,13 +61,9 @@ BINANCE_BACKOFF_BASE_SEC = float(os.getenv("BINANCE_BACKOFF_BASE_SEC", "0.5"))
 REDIS_URL = os.environ.get("REDIS_URL")
 REDIS_RATE_KEY_PREFIX = os.environ.get("REDIS_RATE_KEY_PREFIX", "binance:rate")
 
-# 진행 중 작업을 보관할 키(해시: symbol -> job_id), TTL은 키에 걸지 않고 heartbeat로 주기 갱신
 ACTIVE_HASH_KEY = os.environ.get("ACTIVE_HASH_KEY", "ohlcv:active_jobs")
-# 각 종에 별도 TTL을 줄 수 없으니, 보조로 set을 두고 마지막 하트비트 epoch(ms)도 저장
 ACTIVE_TS_HASH_KEY = os.environ.get("ACTIVE_TS_HASH_KEY", "ohlcv:active_jobs_ts")
-ACTIVE_STALE_MS = int(
-    os.environ.get("ACTIVE_STALE_MS", str(10 * 60 * 1000))
-)  # 10분간 하트비트 없으면 stale
+ACTIVE_STALE_MS = int(os.environ.get("ACTIVE_STALE_MS", str(10 * 60 * 1000)))
 
 _redis: Optional[redis.Redis] = (
     redis.Redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
@@ -276,36 +272,6 @@ def _progress(
     self.update_state(state="PROGRESS", meta=meta)
 
 
-def _run_backfill_for_symbol_interval(
-    http: BinanceHttpClient,
-    db: SyncSession,
-    symbol: str,
-    interval: str,
-    progress_hook,
-    start_ms: int,
-) -> Dict[str, Any]:
-    def _time_cb(pct_time: float, last_updated_ms: int, latest_open_ms: int):
-        progress_hook(pct_time, last_updated_ms, latest_open_ms)
-
-    fetched, last_open = _fetch_all_klines_restapi(
-        http=http,
-        db=db,
-        api_symbol=symbol,
-        interval=interval,
-        start_ms=start_ms,
-        end_ms=None,
-        progress_cb=_time_cb,
-    )
-    return {
-        "symbol": symbol,
-        "interval": interval,
-        "rows_fetched": fetched,
-        "last_open_ms": last_open,
-        "source": RESTAPI_URL,
-        "ok": True,
-    }
-
-
 @celery_app.task(bind=True, name="backfill_all")
 def backfill_all(
     self, api_symbol: str, intervals: Optional[List[str]] = None
@@ -322,7 +288,6 @@ def backfill_all(
 
     base_symbol = _symbol_api_to_db(api_symbol)
     job_id = self.request.id or ""
-
     _active_heartbeat(base_symbol, job_id)
 
     try:
@@ -338,11 +303,10 @@ def backfill_all(
             tradables = load_fapi_symbols(http, EXCHANGE_INFO_URL)
             if api_symbol not in tradables:
                 raise ValueError(
-                    f"[{_TASK_SIGNATURE}] '{api_symbol}'는 Binance Future에서 ohlcv 데이터를 제공하지 않습니다."
+                    f"[{_TASK_SIGNATURE}] '{api_symbol}'는 Binance Future에서 데이터를 제공하지 않습니다."
                 )
 
             results: List[Dict[str, Any]] = []
-
             with SyncSessionLocal() as db:
                 total = len(intervals)
                 _progress(
@@ -353,21 +317,19 @@ def backfill_all(
                     symbol=api_symbol,
                     pct_time=0.0,
                 )
-                _active_heartbeat(base_symbol, job_id)
 
                 for idx, interval in enumerate(intervals, start=1):
                     start_ms = _get_start_ms_from_db(db, api_symbol, interval)
 
                     _progress(
                         self,
-                        status=f"{api_symbol} - {interval} 수집 시작",
+                        status=f"{api_symbol} - {interval} 시작",
                         current=idx - 1,
                         total=total,
                         symbol=api_symbol,
                         interval=interval,
                         pct_time=0.0,
                     )
-                    _active_heartbeat(base_symbol, job_id)
 
                     def _hook(
                         pct_time: float, last_updated_ms: int, latest_open_ms: int
@@ -383,19 +345,25 @@ def backfill_all(
                             last_updated_ms=last_updated_ms,
                             latest_open_ms=latest_open_ms,
                         )
-                        _active_heartbeat(base_symbol, job_id)
 
-                    res = _run_backfill_for_symbol_interval(
+                    fetched, last_open = _fetch_all_klines_restapi(
                         http=http,
                         db=db,
-                        symbol=api_symbol,
+                        api_symbol=api_symbol,
                         interval=interval,
-                        progress_hook=_hook,
                         start_ms=start_ms,
+                        end_ms=None,
+                        progress_cb=_hook,
                     )
-                    results.append(res)
+                    results.append(
+                        {
+                            "symbol": api_symbol,
+                            "interval": interval,
+                            "rows_fetched": fetched,
+                        }
+                    )
 
-                    latest_open_ms = res.get("last_open_ms") or 0
+                    latest_open_ms = last_open or 0
                     now_ms = int(time.time() * 1000)
 
                     _progress(
@@ -409,7 +377,6 @@ def backfill_all(
                         last_updated_ms=now_ms,
                         latest_open_ms=latest_open_ms,
                     )
-                    _active_heartbeat(base_symbol, job_id)
 
         return {
             "task_signature": _TASK_SIGNATURE,
@@ -418,5 +385,6 @@ def backfill_all(
             "results": results,
             "status": "done",
         }
+
     finally:
         _active_clear(base_symbol, job_id)
