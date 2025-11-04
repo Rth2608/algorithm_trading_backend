@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from routers import auth_google, admin, ohlcv_rest
 from fastapi.middleware.cors import CORSMiddleware
 
+##수정확인##
 
 import models
 from models.base import Base
