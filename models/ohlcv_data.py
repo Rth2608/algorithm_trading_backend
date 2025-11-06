@@ -1,25 +1,9 @@
-from __future__ import annotations
 from datetime import datetime
 
-from sqlalchemy import (
-    String,
-    TIMESTAMP,
-    Numeric,
-    Boolean,
-    Enum,
-    ForeignKey,
-    func,
-)
+from sqlalchemy import String, TIMESTAMP, Numeric, Boolean, ForeignKey, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base
-
-ohlcv_source_enum = Enum(
-    "REST",
-    "WS",
-    name="ohlcv_source",
-    schema="trading_data",
-)
 
 
 class _OhlcvBase(Base):
@@ -43,12 +27,9 @@ class _OhlcvBase(Base):
     high: Mapped[float] = mapped_column(Numeric(20, 7), nullable=False)
     low: Mapped[float] = mapped_column(Numeric(20, 7), nullable=False)
     close: Mapped[float] = mapped_column(Numeric(20, 7), nullable=False)
-
     volume: Mapped[float] = mapped_column(Numeric(20, 3), nullable=False)
 
-    src: Mapped[str] = mapped_column(ohlcv_source_enum, nullable=False, default="REST")
-    is_ended: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-
+    is_ended: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     updated_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True),
         nullable=False,
@@ -57,8 +38,13 @@ class _OhlcvBase(Base):
     )
 
 
+# --- 개별 타임프레임 테이블 ---
 class Ohlcv1m(_OhlcvBase):
     __tablename__ = "ohlcv_1m"
+
+
+class Ohlcv3m(_OhlcvBase):
+    __tablename__ = "ohlcv_3m"
 
 
 class Ohlcv5m(_OhlcvBase):
@@ -67,6 +53,10 @@ class Ohlcv5m(_OhlcvBase):
 
 class Ohlcv15m(_OhlcvBase):
     __tablename__ = "ohlcv_15m"
+
+
+class Ohlcv30m(_OhlcvBase):
+    __tablename__ = "ohlcv_30m"
 
 
 class Ohlcv1h(_OhlcvBase):
@@ -79,3 +69,11 @@ class Ohlcv4h(_OhlcvBase):
 
 class Ohlcv1d(_OhlcvBase):
     __tablename__ = "ohlcv_1d"
+
+
+class Ohlcv1w(_OhlcvBase):
+    __tablename__ = "ohlcv_1w"
+
+
+class Ohlcv1M(_OhlcvBase):
+    __tablename__ = "ohlcv_1M"

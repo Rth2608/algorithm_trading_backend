@@ -1,5 +1,5 @@
-from __future__ import annotations
 from datetime import datetime
+
 from sqlalchemy import String, TIMESTAMP, Numeric, ForeignKey, func
 from sqlalchemy.orm import Mapped, mapped_column
 from .base import Base
@@ -45,8 +45,13 @@ class _IndicatorBase(Base):
     )
 
 
+# --- 개별 타임프레임 테이블 ---
 class Indicator1m(_IndicatorBase):
     __tablename__ = "indicators_1m"
+
+
+class Indicator3m(_IndicatorBase):
+    __tablename__ = "indicators_3m"
 
 
 class Indicator5m(_IndicatorBase):
@@ -55,6 +60,10 @@ class Indicator5m(_IndicatorBase):
 
 class Indicator15m(_IndicatorBase):
     __tablename__ = "indicators_15m"
+
+
+class Indicator30m(_IndicatorBase):
+    __tablename__ = "indicators_30m"
 
 
 class Indicator1h(_IndicatorBase):
@@ -67,3 +76,11 @@ class Indicator4h(_IndicatorBase):
 
 class Indicator1d(_IndicatorBase):
     __tablename__ = "indicators_1d"
+
+
+class Indicator1w(_IndicatorBase):
+    __tablename__ = "indicators_1w"
+
+
+class Indicator1M(_IndicatorBase):
+    __tablename__ = "indicators_1M"

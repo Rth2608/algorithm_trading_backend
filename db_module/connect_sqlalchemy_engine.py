@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import os
 from urllib.parse import quote_plus
 from typing import AsyncIterator, Iterator

@@ -1,7 +1,10 @@
 from fastapi import FastAPI
-from routers import auth_google, admin, ohlcv_rest
+from auth import auth_google
+from routers import get_crypto_info
+from backfill import ohlcv_backfill, symbols
 from fastapi.middleware.cors import CORSMiddleware
-
+from auth.auth import router as auth_router
+from auth.auth_google import router as google_router
 
 import models
 from models.base import Base
@@ -22,9 +25,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(auth_google.router)
-app.include_router(admin.router)
-app.include_router(ohlcv_rest.router)
+app.include_router(auth_router)
+app.include_router(google_router)
+app.include_router(get_crypto_info.router)
+app.include_router(ohlcv_backfill.router)
+app.include_router(symbols.router)
 
 
 @app.get("/")
